@@ -20,7 +20,8 @@ CREATE PEER IF NOT EXISTS source_pg FROM POSTGRES WITH (
 -- ADD COLUMN on peerdb.* + CREATE TEMPORARY TABLE/S3 on *.* -- see
 -- clickhouse/init/01_peerdb_etl_user.sh) rather than the ch_admin
 -- bootstrap user. If you changed CLICKHOUSE_ETL_USER/PASSWORD in .env,
--- update this to match -- it's not templated from .env.
+-- update this to match. Credentials below are defaults — create_mirror.sh
+-- injects overrides from .env at apply time via sed.
 --
 -- S3 staging config (bucket/credentials/endpoint) is intentionally omitted
 -- here -- it's already supplied stack-wide via the

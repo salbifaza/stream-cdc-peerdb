@@ -28,8 +28,8 @@ rather than buries:
 **If you have two minutes:** read this section, then
 [Why PeerDB](#why-peerdb-and-not-debezium-fivetran-airbyte-or-triggers) and
 [What this actually proves](#what-this-actually-proves).
-**If you're doing technical diligence:** the `Quickstart` below reproduces
-the whole thing in one command; every technical claim links to the exact
+**If you're doing technical diligence:** `make up && make smoke`
+reproduces the whole thing; every technical claim links to the exact
 script or doc section that proves it, so nothing here should require
 taking my word for it.
 
@@ -127,28 +127,75 @@ from PeerDB's docs:
 ## Quickstart
 
 ```bash
-cp .env.example .env
-docker compose up -d
-./scripts/create_mirror.sh
-./scripts/verify_cdc.sh
+make up       # starts all 11 containers (PeerDB control plane + source + destination)
+make mirror   # creates peers + mirror (waits for PeerDB readiness, injects creds from .env)
+make verify   # row-count check + live insert/update/delete test
 ```
+
+That's it. `make up` starts the full stack, `make mirror` waits for
+PeerDB's SQL interface to become reachable and creates the source/destination
+peers and the CDC mirror, and `make verify` runs the end-to-end CDC
+verification.
 
 First run pulls several images (PeerDB's flow-api/flow-worker/peerdb-server,
 Temporal, ClickHouse, Postgres, MinIO) — expect a few minutes depending on
 your connection. Everything after that (including a full
-`docker compose down -v && docker compose up -d`) is under a minute since
-images are cached.
+`make reset && make up`) is under a minute since images are cached.
 
-Check that the stack is healthy:
+Other useful targets:
 
 ```bash
-docker compose ps
+make status   # replication lag, batch history, slot size, per-table counts
+make logs     # tail all service logs
+make down     # stop, keep data volumes
+make reset    # stop and wipe all state (full rebuild on next make up)
 ```
 
-You should see `source-postgres`, `clickhouse`, `catalog`, `temporal`,
-`temporal-admin-tools`, `flow-api`, `flow-worker`, `flow-snapshot-worker`,
-`peerdb-server`, `peerdb-ui`, and `minio` all `Up` (the ones with
-healthchecks should show `healthy`).
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Source["Source: OLTP"]
+        PG[(Postgres 16<br/>ecommerce db)]
+        WAL[[WAL<br/>wal_level=logical]]
+        SLOT{{Replication slot<br/>peerdb_pub}}
+        PG -- writes --> WAL
+        WAL -- logical decoding<br/>pgoutput --> SLOT
+    end
+
+    subgraph Control["PeerDB control plane"]
+        TEMPORAL[Temporal<br/>workflow engine]
+        CATALOG[(catalog db<br/>mirror metadata)]
+        API[flow-api]
+        SNAP[flow-snapshot-worker]
+        WORKER[flow-worker]
+        API <--> TEMPORAL
+        TEMPORAL <--> CATALOG
+        TEMPORAL -.orchestrates.-> SNAP
+        TEMPORAL -.orchestrates.-> WORKER
+    end
+
+    subgraph Stage["Staging"]
+        S3[(MinIO / S3<br/>Avro batches)]
+    end
+
+    subgraph Dest["Destination: OLAP"]
+        CH[(ClickHouse<br/>peerdb db)]
+    end
+
+    SLOT -- 1 . initial snapshot --> SNAP
+    SLOT -- 2 . streamed changes --> WORKER
+    SNAP -- bulk COPY --> CH
+    WORKER -- batched writes --> S3
+    S3 -- INSERT ... FROM s3&#40;&#41; --> CH
+
+    UI[peerdb-ui / psql :9900] --> API
+```
+
+See [`docs/architecture.md`](docs/architecture.md) for the full mechanics,
+failure-mode findings, engine rationale, and every design decision in detail.
+
+---
 
 ## What's running, and why it's shaped this way
 
@@ -287,9 +334,9 @@ CLICKHOUSE_ETL_USER=peerdb_etl        # least-privilege -- what the PeerDB peer 
 CLICKHOUSE_ETL_PASSWORD=peerdb_etl_password
 ```
 
-`CLICKHOUSE_ETL_USER`/`PASSWORD` aren't templated into
-`scripts/create_mirror.sql` — if you change them in `.env`, update the
-matching `CREATE PEER ch_dest` statement too.
+`scripts/create_mirror.sh` injects credentials from `.env` into the SQL
+at apply time via sed — change `.env`, re-run `make mirror`, and the
+peers pick up the new values without editing the SQL file.
 
 PeerDB's internal catalog/MinIO credentials are fixed in
 `docker-compose.yml` rather than templated — they never leave the Docker
@@ -580,29 +627,37 @@ show awareness of its own scope limits:
 ## Tearing down
 
 ```bash
-docker compose down          # stop, keep data volumes
-docker compose down -v       # stop and wipe all data (start fresh)
+make down      # stop, keep data volumes
+make reset     # stop and wipe all data (start fresh on next make up)
 ```
 
 ## Repo layout
 
 ```
-docker-compose.yml           # full stack: PeerDB control plane + source + destination
-.env.example                 # copy to .env
+docker-compose.yml            # full stack: PeerDB control plane + source + destination
+Makefile                      # all commands: up, mirror, verify, status, reset
+.env.example                  # copy to .env; override credentials here
+LICENSE                       # MIT
+
 postgres/
   init/00_pg-hba-replication.sh # allows replication connections from PeerDB's workers
   init/01_schema.sql            # e-commerce schema + publication
   init/02_seed.sql              # seed data for the initial snapshot
+
 clickhouse/
   init/01_peerdb_etl_user.sh    # provisions the least-privilege peerdb_etl user
+
 peerdb-internal/              # vendored, unmodified PeerDB control-plane config
   volumes/
   scripts/
+
 scripts/
   create_mirror.sql            # CREATE PEER x2 + CREATE MIRROR (stage 3)
   create_mirror.sh             # applies create_mirror.sql via peerdb-server
+                                # (injects credentials from .env at apply time)
   verify_cdc.sh                # row-count check + live insert/update/delete test
   mirror_status.sh             # monitoring: lag, batch history, slot size, real errors (stage 4)
+
 docs/
   architecture.md              # CDC mechanics, diagram, engine rationale, failure-mode evidence
 ```

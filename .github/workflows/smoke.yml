@@ -1,0 +1,49 @@
+name: Smoke Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          cp .env.example .env
+          docker compose up -d
+
+      - name: Create mirror
+        run: ./scripts/create_mirror.sh
+
+      - name: Wait for initial snapshot
+        run: |
+          echo "Waiting up to 120s for initial snapshot to complete..."
+          deadline=$((SECONDS + 120))
+          until docker compose exec -T clickhouse clickhouse-client \
+            --user ch_admin --password ch_admin_password \
+            -q "SELECT count() FROM peerdb.orders FINAL WHERE _peerdb_is_deleted = 0" 2>/dev/null \
+            | grep -q '^30$'; do
+            if [ $SECONDS -ge $deadline ]; then
+              echo "Initial snapshot did not complete within 120s" >&2
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Snapshot complete."
+
+      - name: Verify CDC pipeline
+        run: ./scripts/verify_cdc.sh
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=50
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
