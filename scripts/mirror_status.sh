@@ -45,3 +45,20 @@ FROM peerdb_stats.flow_errors
 WHERE error_type <> 'info'
 ORDER BY error_timestamp DESC
 LIMIT 10;"
+
+# Gold refreshes live in ClickHouse, not PeerDB's catalog. A failed refresh
+# keeps serving the last good result, so "exception is non-empty" and
+# "last_success_time is old" are the signals to alert on -- the data itself
+# won't look broken, just stale.
+if [ -f .env ]; then
+    set -a; . ./.env; set +a
+fi
+echo "== Gold refreshable views (a non-empty exception means gold is serving stale data) =="
+docker compose exec -T clickhouse clickhouse-client \
+    --user "${CLICKHOUSE_USER:-ch_admin}" --password "${CLICKHOUSE_PASSWORD:-ch_admin_password}" -q "
+SELECT view, status, last_success_time, last_success_duration_ms AS last_ms,
+       written_rows, retry, left(exception, 80) AS exception
+FROM system.view_refreshes
+WHERE database = 'gold'
+ORDER BY view
+FORMAT PrettyCompactMonoBlock" </dev/null || echo "  (gold layer not created -- run 'make gold')"

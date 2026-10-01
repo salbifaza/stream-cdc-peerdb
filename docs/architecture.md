@@ -326,6 +326,37 @@ after issuing a 2,000-row insert, then bringing the container back:
   (`docker compose ps`, or in production, orchestrator restart counts) is
   a separate, necessary signal.
 
+## Gold layer: deriving tables from a ReplacingMergeTree mirror
+
+The engine choice above has a consequence one layer up. Silver tables only
+mean "current state" when read with `FINAL` and `_peerdb_is_deleted = 0`;
+at the storage level they are a log of row versions. Anything built on top
+of them has to respect that, and an insert-triggered (incremental)
+materialized view can't: it sees each version as it's written, before
+deduplication. Measured on this stack, an incremental MV summing
+per-customer lifetime value reported **2,000** for an order inserted at
+1,000, updated once, then cancelled. The true contribution is **0**: the
+`paid` and `shipped` versions were each counted as a separate order. A
+delete is one more inserted version, so it subtracts nothing either, and a
+join only refreshes when the left-most table receives an insert.
+
+The gold layer (`clickhouse/gold/`) therefore uses refreshable MVs: a full
+`FINAL` recompute of each gold table every 10 seconds, swapped in
+atomically. That trades compute (proportional to table size, ~45 ms per
+view here) for correctness that doesn't depend on the shape of the change.
+`scripts/verify_gold.sh` checks that correctness by reconciling every gold
+view row for row against the same query run on `source-postgres`, before
+and after a cancellation, a customer attribute change, a line-item delete,
+and a new order; all three views reconcile within ~20s (one sync cycle plus
+one refresh interval).
+
+Failure behavior, tested by removing a refreshable MV's source table and
+bringing it back: the view keeps serving its last good result, records the
+error in `system.view_refreshes.exception` with a growing `retry` count,
+and recovers on the next successful refresh with no intervention. That
+means a broken gold view looks *stale*, not broken, which is why
+`scripts/mirror_status.sh` reports refresh exceptions explicitly.
+
 ## What to say in an interview
 
 If asked to explain this in one breath: *"PeerDB turns Postgres's own
@@ -335,7 +366,8 @@ duplicate data, and changes are batched through S3-compatible staging
 because ClickHouse is a column store that wants bulk inserts, not
 row-by-row writes."* The failure-injection results above (dropped columns
 silently blanking data, a paused mirror retaining WAL indefinitely, a
-killed worker recovering cleanly but invisibly) are what turns that
+killed worker recovering cleanly but invisibly, an incremental MV
+double-counting updates) are what turns that
 sentence from a definition into "I understand the trade-offs, not just the
 happy path" — every claim in this doc was reproduced against this
 project's own running stack, not asserted from documentation.

@@ -41,6 +41,7 @@ taking my word for it.
 | Distributed-systems correctness reasoning (exactly-once handoff, checkpointing, versioned merges) | [`docs/architecture.md`](docs/architecture.md), [engine rationale](docs/architecture.md#clickhouse-table-engine-choice-why-replacingmergetree) |
 | Operational maturity — monitoring, alerting signals, failure injection with evidence | [Stage 4](#stage-4-operations-monitoring-schema-evolution-failure-recovery) |
 | Security by default (least-privilege access, no `trust` auth, credential separation) | [ClickHouse configuration](#clickhouse-configuration) |
+| Derived-data correctness on CDC data (why incremental MVs double-count; reconciliation testing) | [Stage 5](#stage-5-gold-layer-refreshable-materialized-views) |
 | Data-integrity edge cases found by testing, not assumed | [schema evolution findings](docs/architecture.md#schema-evolution) |
 | Honest scope framing — naming what isn't production-ready | [Production considerations](#production-considerations-what-id-change-for-real) |
 | Technical writing that a reviewer can verify, not just read | every code block below is a real command run against this repo |
@@ -57,6 +58,7 @@ the full mechanics and a diagram.
 [What's running](#whats-running-and-why-its-shaped-this-way) ·
 [Creating the mirror](#stage-3-creating-the-mirror) ·
 [Operations](#stage-4-operations-monitoring-schema-evolution-failure-recovery) ·
+[Gold layer](#stage-5-gold-layer-refreshable-materialized-views) ·
 [Production considerations](#production-considerations-what-id-change-for-real) ·
 [Repo layout](#repo-layout)
 
@@ -91,6 +93,13 @@ from PeerDB's docs:
   or renaming one does *not* — and the failure mode is worse than stale
   data, it's silent per-row data loss on the next update to an affected
   row. Full writeup in `docs/architecture.md`.
+- **A streaming gold layer that stays correct under updates and deletes**:
+  three refreshable materialized views reconcile *exactly* against the
+  same aggregations computed directly in Postgres, including after an
+  order is cancelled, a customer's attributes change, and a line item is
+  deleted (~20s end to end). The naive alternative, an insert-triggered
+  incremental MV, was measured reporting 2,000 for an order whose true
+  contribution was 0 — see [Stage 5](#stage-5-gold-layer-refreshable-materialized-views).
 - **Failure recovery**: hard-killing `flow-worker` mid-batch (2,000 rows
   in flight) recovered with the exact row count — no loss, no duplicates —
   once the container came back. Also surfaced a real Docker gotcha:
@@ -112,6 +121,8 @@ from PeerDB's docs:
 - [x] Stage 3 — Creating the mirror, verifying insert/update/delete flow
 - [x] Stage 4 — Monitoring, schema evolution, failure recovery,
       table-engine rationale
+- [x] Stage 5 — Gold layer: refreshable materialized views, verified by
+      reconciliation against the source
 
 ## Prerequisites
 
@@ -127,15 +138,18 @@ from PeerDB's docs:
 ## Quickstart
 
 ```bash
-make up       # starts all 11 containers (PeerDB control plane + source + destination)
-make mirror   # creates peers + mirror (waits for PeerDB readiness, injects creds from .env)
-make verify   # row-count check + live insert/update/delete test
+make up           # starts all 11 containers (PeerDB control plane + source + destination)
+make mirror       # creates peers + mirror (waits for PeerDB readiness, injects creds from .env)
+make verify       # row-count check + live insert/update/delete test
+make gold         # creates the gold layer (refreshable MVs over the mirrored tables)
+make verify-gold  # reconciles gold against Postgres, then re-checks it under updates/deletes
 ```
 
 That's it. `make up` starts the full stack, `make mirror` waits for
 PeerDB's SQL interface to become reachable and creates the source/destination
 peers and the CDC mirror, and `make verify` runs the end-to-end CDC
-verification.
+verification. `make gold` and `make verify-gold` add and check the
+[gold layer](#stage-5-gold-layer-refreshable-materialized-views) on top.
 
 First run pulls several images (PeerDB's flow-api/flow-worker/peerdb-server,
 Temporal, ClickHouse, Postgres, MinIO) — expect a few minutes depending on
@@ -180,7 +194,9 @@ flowchart LR
     end
 
     subgraph Dest["Destination: OLAP"]
-        CH[(ClickHouse<br/>peerdb db)]
+        CH[(ClickHouse<br/>peerdb db<br/>silver)]
+        GOLD[(ClickHouse<br/>gold db)]
+        CH -- refreshable MVs<br/>every 10s, FINAL --> GOLD
     end
 
     SLOT -- 1 . initial snapshot --> SNAP
@@ -593,6 +609,140 @@ pairs from data that was never expressed that way. Full comparison against
 fit — is in
 [`docs/architecture.md`](docs/architecture.md#clickhouse-table-engine-choice-why-replacingmergetree).
 
+## Stage 5: gold layer (refreshable materialized views)
+
+Stages 3–4 produce a faithful *silver* layer: the `peerdb` database is a
+row-for-row mirror of the OLTP tables. Analysts and dashboards usually want
+something else: joined, aggregated, business-shaped tables that stay
+current as the source changes. Stage 5 adds that as a `gold` database in
+the same ClickHouse, kept fresh by
+[refreshable materialized views](https://clickhouse.com/docs/materialized-view/refreshable-materialized-view):
+
+```bash
+make gold         # creates gold.* (re-run after editing any clickhouse/gold/*.sql)
+make verify-gold  # reconciles gold against Postgres, then re-checks it under updates/deletes
+```
+
+| Gold view | Grain | What it exercises |
+|---|---|---|
+| `gold.orders_enriched` | one row per order | denormalized join of orders + customers + line items + payments |
+| `gold.customer_ltv` | one row per customer | rollup that has to *forget* an order when it's cancelled |
+| `gold.daily_revenue_by_category` | one row per (UTC day, category) | four-way join + aggregate |
+
+Each one is a full recompute from silver, every 10 seconds, swapped in
+atomically:
+
+```sql
+CREATE MATERIALIZED VIEW gold.customer_ltv
+REFRESH EVERY 10 SECOND
+ENGINE = MergeTree ORDER BY customer_id
+AS
+SELECT ...
+FROM (SELECT ... FROM peerdb.customers FINAL WHERE _peerdb_is_deleted = 0) AS c
+LEFT JOIN (SELECT ... FROM peerdb.orders FINAL
+           WHERE _peerdb_is_deleted = 0 AND status != 'cancelled'
+           GROUP BY customer_id) AS o ON o.customer_id = c.customer_id;
+```
+
+Every silver read applies `FINAL` and the tombstone filter *inside* a
+subquery, so the filter is evaluated against the collapsed, current
+version of each row (the same rule from Stage 3, applied consistently).
+
+### Why not an ordinary (incremental) materialized view
+
+The usual ClickHouse answer to "keep an aggregate up to date" is an
+incremental MV: an insert trigger that folds each new block into a
+`SummingMergeTree`/`AggregatingMergeTree`. On a CDC-fed
+`ReplacingMergeTree` that's wrong, because PeerDB expresses every
+`UPDATE` as an *insert of a new version*, and the trigger sees each version
+before deduplication. Measured on this stack, with an incremental MV
+computing per-customer lifetime value:
+
+```
+INSERT order (paid, 1000)  -> synced
+UPDATE status = 'shipped'  -> synced
+UPDATE status = 'cancelled'-> synced
+
+incremental MV contribution for this order (truth: 0): 2000
+```
+
+Three versions were inserted, and the trigger summed the first two
+(`paid` and `shipped`) as if they were separate orders. A delete arrives
+the same way, as one more inserted row (with `_peerdb_is_deleted = 1`), so
+it never subtracts anything either. Joins have a further blind spot: an
+incremental MV only fires for inserts into the *left-most* table, so a
+customer changing country would never touch `orders_enriched`. A full
+recompute from `FINAL` has none of these failure modes; the cost is
+discussed below.
+
+### Verification: reconciliation against the source
+
+`scripts/verify_gold.sh` doesn't eyeball the output. For each gold view it
+runs the equivalent SQL directly in `source-postgres` (the ground truth),
+then diffs the two result sets row for row. It then makes exactly the
+changes an incremental MV gets wrong (cancel an order, change a customer's
+country, delete a line item from a multi-item order, insert a new order
+with a payment) and polls until gold reconciles again:
+
+```
+== Step 1: reconcile gold against source-postgres (current state) ==
+  orders_enriched            rows=30   matches postgres (after 0s)
+  customer_ltv               rows=15   matches postgres (after 0s)
+  daily_revenue_by_category  rows=27   matches postgres (after 0s)
+
+== Step 2: changes an incremental MV would get wrong ==
+  cancelling order_id=30 (its revenue must leave daily_revenue_by_category and customer_ltv)...
+  changing customer_id=2's country (every existing order row in orders_enriched must follow)...
+  deleting order_items.order_item_id=18 from a multi-item order (item counts and revenue must drop)...
+  inserting new order_id=31 with one item and a succeeded payment...
+  polling until gold reconciles (CDC sync cycle + 10s refresh; up to 90s)...
+  orders_enriched            rows=31   matches postgres (after 20s)
+  customer_ltv               rows=15   matches postgres (after 20s)
+  daily_revenue_by_category  rows=26   matches postgres (after 20s)
+
+Gold verification PASSED.
+```
+
+The ~20s is the end-to-end freshness budget: one PeerDB sync cycle
+(~10s) plus up to one refresh interval (10s). Each refresh itself took
+~45 ms at this data size (`last_success_duration_ms` in
+`system.view_refreshes`).
+
+### What happens when a refresh fails
+
+Tested by dropping a refreshable MV's source table out from under it, which
+is what a `RESYNC MIRROR` does to `peerdb.*` for a moment:
+
+- The view **keeps serving its last successful result**. Readers see stale
+  data, not an error and not an empty table.
+- `system.view_refreshes` shows the error in `exception` and an increasing
+  `retry` count. It keeps retrying on schedule.
+- Once the source table came back, the next refresh **recovered on its own**
+  (`retry` back to 0, `exception` cleared) with no manual step.
+
+That's the right default for a dashboard, but it means a broken gold view
+looks *healthy* to anyone just reading it. `make status` now ends with a
+gold section that surfaces `exception`, `retry`, and `last_success_time`.
+Those, not the data, are what to alert on.
+
+### Design choices worth naming
+
+- **Gold lives in its own database, created by `ch_admin`.** The
+  `peerdb_etl` user's grants stop at `peerdb.*`, so PeerDB can't modify gold,
+  and a resync that recreates silver tables doesn't drop gold with them.
+- **Created by a script after the mirror, not at container boot.** A
+  refreshable MV's `SELECT` is validated at `CREATE` time, so the silver
+  tables must already exist; `create_gold.sh` waits for them.
+- **Each view file is drop-and-recreate.** Gold is fully derived, so that
+  loses nothing and makes `make gold` the deploy step for SQL changes. The
+  cost is a brief window, while it's recreated, where the view doesn't
+  exist.
+- **Days are bucketed in UTC explicitly** (`toDate(created_at, 'UTC')`) so
+  results don't shift with the server's timezone setting.
+- **Gold inherits silver's correctness.** The column rename/drop data loss
+  from Stage 4 flows straight through into gold. Reconciliation would
+  catch it, but nothing in the refresh itself would.
+
 ## Production considerations (what I'd change for real)
 
 Named explicitly rather than left implicit, since a portfolio piece should
@@ -623,6 +773,14 @@ show awareness of its own scope limits:
   `snapshot_num_rows_per_partition`, and ClickHouse part-merge tuning are
   all real levers a production initial-load would need that aren't
   exercised at this scale.
+- **Gold is a full recompute every 10s.** That's cheap here (~45 ms per
+  view at this scale, not load-tested beyond it), but cost grows with
+  table size, not change volume. At larger scale I'd limit each refresh to
+  a recent window (e.g. the last N days) and append into a target table
+  (`REFRESH ... APPEND TO`), or move truly incremental aggregation to a
+  streaming engine that understands retractions (RisingWave, Flink,
+  Materialize). That adds a system to operate, the same trade-off as the
+  Debezium+Kafka row in the tool-selection table.
 
 ## Tearing down
 
@@ -635,7 +793,7 @@ make reset     # stop and wipe all data (start fresh on next make up)
 
 ```
 docker-compose.yml            # full stack: PeerDB control plane + source + destination
-Makefile                      # all commands: up, mirror, verify, status, reset
+Makefile                      # all commands: up, mirror, verify, gold, verify-gold, status, reset
 .env.example                  # copy to .env; override credentials here
 LICENSE                       # MIT
 
@@ -646,6 +804,7 @@ postgres/
 
 clickhouse/
   init/01_peerdb_etl_user.sh    # provisions the least-privilege peerdb_etl user
+  gold/*.sql                    # gold database + refreshable MVs (stage 5), applied by create_gold.sh
 
 peerdb-internal/              # vendored, unmodified PeerDB control-plane config
   volumes/
@@ -656,7 +815,9 @@ scripts/
   create_mirror.sh             # applies create_mirror.sql via peerdb-server
                                 # (injects credentials from .env at apply time)
   verify_cdc.sh                # row-count check + live insert/update/delete test
-  mirror_status.sh             # monitoring: lag, batch history, slot size, real errors (stage 4)
+  mirror_status.sh             # monitoring: lag, batch history, slot size, real errors, gold refreshes
+  create_gold.sh               # applies clickhouse/gold/*.sql once the mirror's tables exist (stage 5)
+  verify_gold.sh               # reconciles gold against Postgres, before and after live changes
 
 docs/
   architecture.md              # CDC mechanics, diagram, engine rationale, failure-mode evidence

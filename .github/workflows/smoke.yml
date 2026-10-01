@@ -37,8 +37,14 @@ jobs:
           done
           echo "Snapshot complete."
 
+      - name: Create gold layer
+        run: ./scripts/create_gold.sh
+
       - name: Verify CDC pipeline
         run: ./scripts/verify_cdc.sh
+
+      - name: Verify gold layer
+        run: ./scripts/verify_gold.sh
 
       - name: Show logs on failure
         if: failure()

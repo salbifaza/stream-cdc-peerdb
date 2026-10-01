@@ -1,4 +1,4 @@
-.PHONY: help up down reset logs mirror verify status smoke
+.PHONY: help up down reset logs mirror verify status gold verify-gold smoke
 
 help:
 	@echo "Usage:"
@@ -9,8 +9,12 @@ help:
 	@echo ""
 	@echo "  make mirror          Create peers + mirror (idempotent, waits for PeerDB readiness)"
 	@echo "  make verify          Row-count check + live insert/update/delete test"
-	@echo "  make status          Replication lag, batch history, slot size, per-table counts"
-	@echo "  make smoke           Full end-to-end smoke test (mirror + verify)"
+	@echo "  make status          Replication lag, batch history, slot size, per-table counts, gold refreshes"
+	@echo ""
+	@echo "  make gold            Create/redeploy the gold layer (refreshable MVs in ClickHouse)"
+	@echo "  make verify-gold     Reconcile gold against Postgres, then test it under updates/deletes"
+	@echo ""
+	@echo "  make smoke           Full end-to-end smoke test (mirror + gold + verify + verify-gold)"
 
 # ── infrastructure ────────────────────────────────────────────────────────────
 
@@ -47,6 +51,14 @@ verify:
 status:
 	./scripts/mirror_status.sh
 
+# ── gold layer ────────────────────────────────────────────────────────────────
+
+gold:
+	./scripts/create_gold.sh
+
+verify-gold:
+	./scripts/verify_gold.sh
+
 # ── testing ───────────────────────────────────────────────────────────────────
 
-smoke: mirror verify
+smoke: mirror gold verify verify-gold
